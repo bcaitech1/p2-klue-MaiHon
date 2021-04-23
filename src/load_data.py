@@ -146,6 +146,7 @@ def tokenized_dataset2(dataset, tokenizer, xlm=False, max_length=None, mask_padd
     if max_length is None: max_length = 150
 
     features = []
+    max_pos = 0
     for idx, sample in dataset.iterrows():
         tokens = tokenizer.tokenize(sample['sentence'])
         l = len(tokens)
@@ -168,14 +169,14 @@ def tokenized_dataset2(dataset, tokenizer, xlm=False, max_length=None, mask_padd
             except Exception as e:
                 e2s = tokens.index("$") + 2
             e2e = l - tokens[::-1].index("$")
-
+        max_pos = max(max_pos, e1s, e2s)
 
         if not xlm:
             tokens = ["[CLS]"] + tokens + ["[SEP]"]
         else:
             tokens = ["<s>"] + tokens + ["</s>"]
         segment_ids = [0] * len(tokens)
-        # segment_ids[0] = 1
+        segment_ids[0] = 1
 
         input_ids = tokenizer.convert_tokens_to_ids(tokens)
         input_mask = [1 if mask_padding_with_zero else 0] * len(input_ids)
@@ -190,16 +191,14 @@ def tokenized_dataset2(dataset, tokenizer, xlm=False, max_length=None, mask_padd
         e2_mask = [0 for _ in range(len(input_mask))]
         for i in range(e1s, e1e):
             e1_mask[i] = 1
-            segment_ids[i] = 1
         for i in range(e2s, e2e):
             e2_mask[i] = 1
-            segment_ids[i] = 2
 
         if padding_length < 0:
             if xlm:
                 input_ids = input_ids[:max_length-1] + tokenizer.convert_tokens_to_ids(["</s>"])
             else:
-                input_ids = input_ids[:max_length - 1] + tokenizer.convert_tokens_to_ids(["[SEP]"])
+                input_ids = input_ids[:max_length-1] + tokenizer.convert_tokens_to_ids(["[SEP]"])
             input_mask = input_mask[:max_length-1] + [1 if mask_padding_with_zero else 0]
             segment_ids = segment_ids[:max_length-1] + [0]
             e1_mask = e1_mask[:max_length-1] + [0]

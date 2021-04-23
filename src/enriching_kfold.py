@@ -17,7 +17,6 @@ import random
 import numpy as np
 import torch
 
-
 # 평가를 위한 metrics function.
 def compute_metrics(pred):
   labels = pred.label_ids
@@ -45,7 +44,7 @@ def train():
   parser = argparse.ArgumentParser()
   parser.add_argument('--model_name', default='bert-base-multilingual-cased')
   parser.add_argument('--version', default='v6', type=str)
-  parser.add_argument('--n_splits', type=int, default=0.0)
+  parser.add_argument('--n_splits', type=int, default=5)
   parser.add_argument('--epochs', type=int, default=5)
   parser.add_argument('--lr', type=float, default=2e-5)
   parser.add_argument('--adam_eps', type=float, default=1e-8)
@@ -56,10 +55,13 @@ def train():
   parser.add_argument('--max_grad_norm', type=float, default=1.0)
   parser.add_argument('--l2_reg_lambda', type=float, default=5e-3)
   parser.add_argument('--hidden_dropout_prob', type=float, default=0.2)
-  parser.add_argument('--max_len', type=int, default=150)
+  parser.add_argument('--max_len', type=int, default=250)
   parser.add_argument('--scheduler_type', type=str, default='cosine')
   parser.add_argument('--data_type', type=str, default='original')
   parser.add_argument('--cls_weight', type=int, default=1)
+  parser.add_argument('--fold_s', type=int, default=0)
+  parser.add_argument('--fold_e', type=int, default=5)
+  parser.add_argument('--smoothing', type=float, default=0.0)
 
   args = parser.parse_args()
 
@@ -91,7 +93,6 @@ def train():
   # load dataset
   total_dataset = load_data2([
       train_data_path,
-      # '../aug_data/new_data_en.tsv', '../aug_data/new_data_ja.tsv', '../aug_data/new_data_zh.tsv'
   ], "../data/label_type.pkl")
 
   targs = [19, 37, 40]
@@ -105,9 +106,11 @@ def train():
   # total_dataset = pd.concat([total_dataset, add_df], axis=0)
   # total_dataset.reset_index(inplace=True)
   device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-
   kfold = StratifiedKFold(n_splits=args.n_splits, shuffle=True, random_state=42)
   for fold_idx, (trn_idx, val_idx) in enumerate(kfold.split(total_dataset, total_dataset.label)):
+    if fold_idx < args.fold_s: continue
+    if fold_idx > args.fold_e: continue
+
     train_ds = total_dataset.loc[trn_idx, :]
     valid_ds = total_dataset.loc[val_idx, :]
 
@@ -157,7 +160,7 @@ def train():
         trn_cls_weight = torch.tensor(trn_cls_weight, dtype=torch.float32).to(device)
     else:
         trn_cls_weight = None
-    train_ds = TensorDataset(all_input_ids, all_input_mask,all_segment_ids, all_label_ids, all_e1_mask, all_e2_mask)
+    train_ds = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids, all_e1_mask, all_e2_mask)
     train_dl = torch.utils.data.DataLoader(
 	    train_ds,
 	    batch_size=args.batch_size,
@@ -174,7 +177,7 @@ def train():
     if MODEL_NAME.startswith("bert"):
       model = BertForSequenceClassification(model_config, MODEL_NAME)
     elif MODEL_NAME.startswith("xlm"):
-      model = XLMRobertaForSequenceClassification(model_config, MODEL_NAME)
+      model = XLMRobertaForSequenceClassification(model_config, MODEL_NAME, smoothing=args.smoothing)
     model.parameters
     model.to(device)
 
@@ -252,38 +255,39 @@ def train():
                 total_sample = 0
                 valid_step = 1
                 epoch_iterator = tqdm(valid_dl, desc="Iteration")
-                for step, batch in enumerate(epoch_iterator):
-                    model.eval()
-                    batch = tuple(t.to(device) for t in batch)
-                    inputs = {'input_ids': batch[0],
-		                      'attention_mask': batch[1],
-		                      'token_type_ids': batch[2],
-		                      'labels': batch[3],
-		                      'e1_mask': batch[4],
-		                      'e2_mask': batch[5],
-                              'cls_weight': val_cls_weight
-                             }
+                with torch.no_grad():
+                    for step, batch in enumerate(epoch_iterator):
+                        model.eval()
+                        batch = tuple(t.to(device) for t in batch)
+                        inputs = {'input_ids': batch[0],
+                                  'attention_mask': batch[1],
+                                  'token_type_ids': batch[2],
+                                  'labels': batch[3],
+                                  'e1_mask': batch[4],
+                                  'e2_mask': batch[5],
+                                  'cls_weight': val_cls_weight
+                                 }
 
-                    outputs = model(**inputs)
-                    # model outputs are always tuple in pytorch-transformers (see doc)
-                    loss = outputs[0]
-                    pred = outputs[1]
-                    _, pred = torch.max(pred, dim=-1)
-                    corrects += np.sum((pred == batch[3]).detach().cpu().numpy())
-                    total_sample += batch[0].size(0)
-                    val_acc = corrects / total_sample * 100
-                    val_loss += loss.item()
-                    valid_step += 1
+                        outputs = model(**inputs)
+                        # model outputs are always tuple in pytorch-transformers (see doc)
+                        loss = outputs[0]
+                        pred = outputs[1]
+                        _, pred = torch.max(pred, dim=-1)
+                        corrects += np.sum((pred == batch[3]).detach().cpu().numpy())
+                        total_sample += batch[0].size(0)
+                        val_acc = corrects / total_sample * 100
+                        val_loss += loss.item()
+                        valid_step += 1
 
                 wandb.log({f"Fold{fold_idx}_val_loss": val_loss/valid_step, f"Fold{fold_idx}_val_acc": val_acc})
                 logging.info(f"[{fold_idx}] -> global_step = %s, average loss = %s", global_step, tr_loss/global_step)
-                if min_loss > val_loss/valid_step:
-                   logging.info(f"Loss: {min_loss:.6f} -> {val_loss/valid_step:.6f}")
-                   logging.info("save.")
-                   min_loss = val_loss/valid_step
-
-                   save_path = os.path.join(f"../results/{args.version}/{fold_idx}_checkpoint-best_loss")
-                   model.save_pretrained(save_path)
+                # if min_loss > val_loss/valid_step:
+                #    logging.info(f"Loss: {min_loss:.6f} -> {val_loss/valid_step:.6f}")
+                #    logging.info("save.")
+                #    min_loss = val_loss/valid_step
+                #
+                #    save_path = os.path.join(f"../results/{args.version}/{fold_idx}_checkpoint-best_loss")
+                #    model.save_pretrained(save_path)
 
                 if max_acc < val_acc:
                    logging.info(f"Acc: {max_acc:.3f} -> {val_acc:.3f}")
@@ -293,6 +297,7 @@ def train():
                    save_path = os.path.join(f"../results/{args.version}/{fold_idx}_checkpoint-best_acc")
                    model.save_pretrained(save_path)
 
+    del model
 
 if __name__ == '__main__':
   train()
